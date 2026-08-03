@@ -3,6 +3,30 @@
 ## [Unreleased]
 
 ### Added
+- **Deterministic Gauss-Jacobi quadrature for weakly singular kernels.**
+  `kernel_singularity` on the callable-input solvers now also accepts the
+  singularity exponent -- a dict `{location: alpha}` or `(location, alpha)`
+  pairs, declaring `K(u) ~ |u - u0|^{-alpha}` with `0 < alpha < 1`. Singular
+  weight blocks whose declared singularities carry exponents are evaluated by
+  fixed-order Gauss-Jacobi rules that build the singular factor into the
+  quadrature weight exactly (interior singular points split the block into
+  one-sided pieces), guarded by the same two-order acceptance check as the
+  smooth Gauss-Legendre path with per-basis adaptive fallback -- a wrong
+  exponent degrades bit-identically to the adaptive path. The blocks are
+  deterministic, so they join the uniform-mesh Toeplitz reuse set under the
+  strict reproducibility policy: Abel-kernel assembly runs ~16-19x faster
+  than the per-row adaptive path with no opt-in flag (Abel VIE-2, p=3,
+  M=1280: 3.8 s -> 0.24 s), equal-lag singular blocks are bitwise equal, and
+  the vector path sheds its `quad_vec` tolerance errors (~1e-8 -> ~1e-15
+  against an independent reference). Deviations from the adaptive path are
+  bounded by the acceptance tolerance (worst measured 1.2e-9 scale-relative
+  across a 56-case A/B battery; all 46 legacy-form cases bit-identical). A
+  companion kwarg `singular_quadrature='auto'|'adaptive'` (default `'auto'`)
+  forces the historical adaptive path when set to `'adaptive'`. Bare
+  locations, lists, and callables keep the historical behavior bit for bit.
+  See `notes/gauss_jacobi_notes.pdf` on the branch for derivations,
+  verification, and benchmarks.
+
 - **`reuse_adaptive_blocks` flag** on the callable-input solvers
   (`function_solve_VIE_1/2`, `function_solve_VIDE`). On uniform meshes with
   convolution kernels the weight tensor is assembled from one integrated row;

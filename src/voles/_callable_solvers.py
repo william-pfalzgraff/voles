@@ -229,21 +229,46 @@ def _resolve_node_pos(coll_nodes, coll_divs, coll_choices, *,
 # Weight-tensor builder
 # ---------------------------------------------------------------------------
 
-def _normalize_kernel_singularity(kernel_singularity):
-    """Return a callable `t -> list[float]` giving singular s-locations.
+def _check_singularity_alpha(alpha):
+    """Validate a declared power-law exponent: K(u) ~ |u - u0|^{-alpha}."""
+    alpha = float(alpha)
+    if not 0.0 < alpha < 1.0:
+        raise ValueError(
+            "kernel singularity exponent must satisfy 0 < alpha < 1 "
+            "(got {}); omit the exponent to use adaptive quadrature".format(alpha))
+    return alpha
 
-    Accepts None, float, list of float, or callable. The float/list form is
-    wrapped as convolution-style: `lambda t: [t - u for u in declared_us]`.
+
+def _normalize_kernel_singularity(kernel_singularity):
+    """Return a callable `t -> list[(s_loc, alpha)]` giving singular
+    s-locations and, when declared, the power-law exponent alpha of each
+    (K(u) ~ |u - u0|^{-alpha} near the singular point; alpha is None when
+    only the location is known).
+
+    Accepts None; a float location; a dict ``{location: alpha}``; an iterable
+    mixing float locations and ``(location, alpha)`` pairs; or a callable
+    ``t -> list of s-locations`` (locations only). Non-callable forms are
+    convolution-style: locations are in u = t - s, so s_loc = t - u.
     """
     if kernel_singularity is None:
         return lambda t: []
     if callable(kernel_singularity):
-        return kernel_singularity
+        f = kernel_singularity
+        return lambda t: [(float(loc), None) for loc in f(t)]
     if isinstance(kernel_singularity, (int, float)):
-        declared = [float(kernel_singularity)]
+        entries = [(float(kernel_singularity), None)]
+    elif isinstance(kernel_singularity, dict):
+        entries = [(float(u), _check_singularity_alpha(a))
+                   for u, a in kernel_singularity.items()]
     else:
-        declared = [float(u) for u in kernel_singularity]
-    return lambda t, _us=tuple(declared): [t - u for u in _us]
+        entries = []
+        for item in kernel_singularity:
+            if isinstance(item, (int, float)):
+                entries.append((float(item), None))
+            else:
+                u, a = item
+                entries.append((float(u), _check_singularity_alpha(a)))
+    return lambda t, _es=tuple(entries): [(t - u, a) for u, a in _es]
 
 
 @functools.lru_cache(maxsize=16)
@@ -253,6 +278,44 @@ def _gauss_legendre_nodes_weights(order: int) -> tuple[np.ndarray, np.ndarray]:
     nodes.setflags(write=False)
     weights.setflags(write=False)
     return nodes, weights
+
+
+@functools.lru_cache(maxsize=64)
+def _gauss_jacobi_nodes_weights(order: int, alpha_right: float,
+                                alpha_left: float) -> tuple[np.ndarray, np.ndarray]:
+    """Gauss-Jacobi nodes and *folded* weights on [-1, 1] for a weakly
+    singular block whose integrand carries the factors (1-x)^{-alpha_right}
+    and (1+x)^{-alpha_left} at the endpoints.
+
+    The rule underneath is Gauss-Jacobi for the weight
+    (1-x)^{-alpha_right} (1+x)^{-alpha_left}, so
+
+        sum_q w_q g(x_q)  ~  int_{-1}^{1} (1-x)^{-aR} (1+x)^{-aL} g(x) dx,
+
+    exact for polynomial g of degree <= 2*order - 1. The returned weights are
+    folded with the reciprocal singular factors at the nodes,
+
+        w_folded[q] = w_q (1 - x_q)^{aR} (1 + x_q)^{aL},
+
+    so a singular block integral can be accumulated exactly like a smooth
+    Gauss-Legendre block, from raw kernel values at the nodes:
+
+        int_A^B K(tau - s) L(s) ds  ~  half * sum_q w_folded[q] K(u_q) L(s_q)
+
+    with half = (B-A)/2. The kernel's singular factor |s - s*|^{-alpha} at the
+    node cancels the folded factor analytically; the rule sees only the smooth
+    remainder. alpha_right/alpha_left of 0.0 (no singularity at that end)
+    reduce the folding to a no-op, and (0, 0) reduces to Gauss-Legendre.
+    """
+    try:
+        from scipy.special import roots_jacobi
+    except ImportError as e:
+        raise ImportError(_SCIPY_IMPORT_ERR) from e
+    nodes, weights = roots_jacobi(order, -alpha_right, -alpha_left)
+    folded = weights * (1.0 - nodes) ** alpha_right * (1.0 + nodes) ** alpha_left
+    nodes.setflags(write=False)
+    folded.setflags(write=False)
+    return nodes, folded
 
 
 def _detect_kernel_vectorized(kernel, sample_u: float, is_vector: bool, d: int) -> bool:
@@ -324,7 +387,8 @@ def _build_W_with_basis_scalar(kernel, mesh_breakpoints: np.ndarray,
                                 kernel_singularity,
                                 smooth_gl_order: int, basis: np.ndarray,
                                 smooth_check_tol: float = 1e-9,
-                                reuse_adaptive_blocks: bool = False) -> np.ndarray:
+                                reuse_adaptive_blocks: bool = False,
+                                singular_quadrature: str = 'auto') -> np.ndarray:
     """Build the weight tensor W[n, i, l, k] = integral of K(tau_{n,i} - s)
     times basis[k](s_norm) on interval l. Shape (M, p, M, n_basis).
 
@@ -336,6 +400,12 @@ def _build_W_with_basis_scalar(kernel, mesh_breakpoints: np.ndarray,
     ``reuse_adaptive_blocks`` extends the uniform-mesh Toeplitz reuse to the
     adaptive-quadrature blocks (see the public solvers' docstrings); it has
     no effect off the Toeplitz fast path.
+
+    ``singular_quadrature='auto'`` evaluates singular blocks whose declared
+    singularities all carry an exponent alpha by deterministic fixed-order
+    Gauss-Jacobi rules (two-order acceptance check, adaptive fallback);
+    ``'adaptive'`` forces the per-basis adaptive path for every singular
+    block regardless of declared exponents.
     """
     M = len(mesh_breakpoints) - 1
     node_pos = np.asarray(node_pos, dtype=float)
@@ -353,6 +423,7 @@ def _build_W_with_basis_scalar(kernel, mesh_breakpoints: np.ndarray,
     reuse_all = reuse_adaptive_blocks and toeplitz
     quad_opts = ({'limit': 200, 'epsabs': 1e-12, 'epsrel': 1e-12}
                  if reuse_all else {'limit': 100})
+    gj_enabled = singular_quadrature == 'auto'
 
     # Detect once whether the kernel broadcasts over a numpy array of u values;
     # if so, the smooth-path GL quadrature can be done in a single numpy call.
@@ -444,12 +515,37 @@ def _build_W_with_basis_scalar(kernel, mesh_breakpoints: np.ndarray,
         return integrand
 
     def classify_sing(sing, a_int, b_int):
-        """Split declared singular s-locations into interior points and an
-        endpoint flag for [a_int, b_int]; returns (interior, use_adaptive)."""
+        """Classify declared singular (s_loc, alpha) entries against the block
+        [a_int, b_int]. Returns (touching, interior_pts): ``touching`` is a
+        list of ('interior'|'left'|'right', loc, alpha) for every entry that
+        makes the block singular (interior point, or within tol of either
+        endpoint); ``interior_pts`` collects the interior locations in
+        declaration order for scipy.quad's ``points``. The block is singular
+        iff ``touching`` is non-empty -- the same criterion as the historical
+        (interior, use_adaptive) contract."""
         tol = 1e-12 * max(1.0, abs(b_int - a_int))
-        interior = [sp for sp in sing if a_int + tol < sp < b_int - tol]
-        endpoint = any(abs(sp - a_int) < tol or abs(sp - b_int) < tol for sp in sing)
-        return interior, (bool(interior) or endpoint)
+        touching = []
+        interior_pts = []
+        for loc, al in sing:
+            if a_int + tol < loc < b_int - tol:
+                touching.append(('interior', loc, al))
+                interior_pts.append(loc)
+            elif abs(loc - a_int) < tol:
+                touching.append(('left', loc, al))
+            elif abs(loc - b_int) < tol:
+                touching.append(('right', loc, al))
+        return touching, interior_pts
+
+    def gj_eligible(touching, a_int, b_int):
+        """A singular block takes the deterministic Gauss-Jacobi path iff every
+        touching singularity declares an exponent and no two singular points
+        coincide (coincident points would need a merged weight; the adaptive
+        path handles that degenerate case as before)."""
+        if not gj_enabled or any(al is None for _kind, _loc, al in touching):
+            return False
+        locs = sorted(loc for _kind, loc, _al in touching)
+        tol = 1e-12 * max(1.0, abs(b_int - a_int))
+        return all(l2 - l1 > 2.0 * tol for l1, l2 in zip(locs, locs[1:]))
 
     def adaptive_block(n, i, l, tau, t_l, h_l, a_int, b_int, interior_sing):
         """Singular block: per-basis adaptive quadrature."""
@@ -460,6 +556,60 @@ def _build_W_with_basis_scalar(kernel, mesh_breakpoints: np.ndarray,
             val, _err = get_quad()(make_integrand(tau, t_l, h_l, k),
                                    a_int, b_int, **kwargs)
             W[n, i, l, k] = val
+
+    def gj_block(n, i, l, tau, t_l, h_l, a_int, b_int, touching, interior_sing):
+        """Singular block with declared exponent(s): deterministic fixed-order
+        Gauss-Jacobi quadrature with the same two-order acceptance check as
+        the smooth path. The block is split at interior singular points; each
+        piece carries the exponents of its singular endpoint(s) as Jacobi
+        weights, and the folded-weight rule (_gauss_jacobi_nodes_weights)
+        accumulates raw kernel values exactly like a smooth GL block. Kernel
+        arguments use the endpoint-anchored form u_q = (tau - B) + half*(1-x_q),
+        which is exact at a diagonal singular endpoint (tau - B == 0). Any
+        basis function failing the check falls back to the identical adaptive
+        call the pure-adaptive path would make. Returns True iff every basis
+        function passed (a deterministic value, reusable across Toeplitz
+        rows)."""
+        al_left = 0.0
+        al_right = 0.0
+        interior = []
+        for kind, loc, al in touching:
+            if kind == 'left':
+                al_left = al
+            elif kind == 'right':
+                al_right = al
+            else:
+                interior.append((loc, al))
+        interior.sort()
+        bounds = [(a_int, al_left)] + interior + [(b_int, al_right)]
+        est = []
+        for o in orders:
+            acc = np.zeros(n_basis)
+            for (A, aA), (B, aB) in zip(bounds[:-1], bounds[1:]):
+                x, wf = _gauss_jacobi_nodes_weights(o, aB, aA)
+                half = 0.5 * (B - A)
+                s_q = 0.5 * (A + B) + half * x
+                u_q = (tau - B) + half * (1.0 - x)
+                if kernel_vec:
+                    kvals = np.asarray(kernel(u_q), dtype=np.float64)
+                else:
+                    # No forced float dtype (see note in smooth_diag_vals).
+                    kvals = np.array([kernel(u) for u in u_q])
+                xn = (s_q - t_l) / h_l
+                Bmat = np.array([npp.polyval(xn, basis[k]) for k in range(n_basis)])
+                acc = acc + half * (Bmat @ (wf * kvals))
+            est.append(acc)
+        v1, v2 = est
+        W[n, i, l, :] = v2
+        ok = np.abs(v1 - v2) <= smooth_check_tol * np.maximum(1.0, np.abs(v2))
+        for k in np.nonzero(~ok)[0]:
+            kwargs = dict(quad_opts)
+            if interior_sing:
+                kwargs['points'] = interior_sing
+            val, _err = get_quad()(make_integrand(tau, t_l, h_l, int(k)),
+                                   a_int, b_int, **kwargs)
+            W[n, i, l, int(k)] = val
+        return bool(ok.all())
 
     def store_smooth(n, i, l, tau, t_l, h_l, a_int, b_int, v1, v2):
         """Store the order-(ord+2) estimate v2 for every basis function, then fall
@@ -526,9 +676,16 @@ def _build_W_with_basis_scalar(kernel, mesh_breakpoints: np.ndarray,
             for i in range(p):
                 if skip_off is not None and skip_off[i, lag]:
                     continue
-                interior_sing, use_adaptive = classify_sing(sing_per_i[i], a_int, b_int)
-                if use_adaptive:
-                    adaptive_block(n, i, l, tau_n[i], t_l, h_l, a_int, b_int, interior_sing)
+                touching, interior_sing = classify_sing(sing_per_i[i], a_int, b_int)
+                if touching:
+                    if gj_eligible(touching, a_int, b_int):
+                        clean = gj_block(n, i, l, tau_n[i], t_l, h_l,
+                                         a_int, b_int, touching, interior_sing)
+                        if record:
+                            ok_off[i, lag] = clean
+                    else:
+                        adaptive_block(n, i, l, tau_n[i], t_l, h_l, a_int, b_int,
+                                       interior_sing)
                 else:
                     smooth_is.append(i)
 
@@ -553,9 +710,15 @@ def _build_W_with_basis_scalar(kernel, mesh_breakpoints: np.ndarray,
             b_int = tau
             if b_int <= a_int:
                 continue
-            interior_sing, use_adaptive = classify_sing(sing_per_i[i], a_int, b_int)
-            if use_adaptive:
-                adaptive_block(n, i, l, tau, t_l, h_l, a_int, b_int, interior_sing)
+            touching, interior_sing = classify_sing(sing_per_i[i], a_int, b_int)
+            if touching:
+                if gj_eligible(touching, a_int, b_int):
+                    clean = gj_block(n, i, l, tau, t_l, h_l, a_int, b_int,
+                                     touching, interior_sing)
+                    if record and clean:
+                        ok_diag[i] = True
+                else:
+                    adaptive_block(n, i, l, tau, t_l, h_l, a_int, b_int, interior_sing)
                 continue
             v1, v2 = smooth_diag_vals(a_int, b_int, tau, i)
             clean = store_smooth(n, i, l, tau, t_l, h_l, a_int, b_int, v1, v2)
@@ -567,7 +730,8 @@ def _build_W_with_basis_scalar(kernel, mesh_breakpoints: np.ndarray,
     # last row (which contains every lag), copy it band-diagonally, then --
     # unless reuse_adaptive_blocks -- recompute the non-GL-clean entries of
     # every other row exactly as the general path would (see _toeplitz_W_rows
-    # for the reuse policy).
+    # for the reuse policy; Gauss-Jacobi-accepted singular blocks count as
+    # clean, deterministic entries and are reused like GL blocks).
     if toeplitz:
         ok_off, ok_diag = integrate_row(M - 1, record=True)
         if M >= 2:
@@ -593,13 +757,15 @@ def _build_W_with_basis_scalar(kernel, mesh_breakpoints: np.ndarray,
 
 def _build_W_scalar(kernel, mesh_breakpoints, node_pos,
                     kernel_singularity, smooth_gl_order,
-                    smooth_check_tol=1e-9, reuse_adaptive_blocks=False):
+                    smooth_check_tol=1e-9, reuse_adaptive_blocks=False,
+                    singular_quadrature='auto'):
     """VIE-2 weight tensor: Lagrange basis, shape (M, p, M, p)."""
     basis = _lagrange_basis_coefs(node_pos)
     return _build_W_with_basis_scalar(kernel, mesh_breakpoints, node_pos,
                                        kernel_singularity,
                                        smooth_gl_order, basis, smooth_check_tol,
-                                       reuse_adaptive_blocks)
+                                       reuse_adaptive_blocks,
+                                       singular_quadrature)
 
 
 def _build_W_with_basis_vector(kernel, mesh_breakpoints: np.ndarray,
@@ -607,7 +773,8 @@ def _build_W_with_basis_vector(kernel, mesh_breakpoints: np.ndarray,
                                 kernel_singularity, smooth_gl_order: int,
                                 d: int, basis: np.ndarray,
                                 smooth_check_tol: float = 1e-9,
-                                reuse_adaptive_blocks: bool = False) -> np.ndarray:
+                                reuse_adaptive_blocks: bool = False,
+                                singular_quadrature: str = 'auto') -> np.ndarray:
     """Vector analogue of _build_W_with_basis_scalar. Returns (M, p, M, n_basis, d, d)."""
     M = len(mesh_breakpoints) - 1
     node_pos = np.asarray(node_pos, dtype=float)
@@ -616,11 +783,12 @@ def _build_W_with_basis_vector(kernel, mesh_breakpoints: np.ndarray,
     widths = np.diff(mesh_breakpoints)
     singular_locs = _normalize_kernel_singularity(kernel_singularity)
 
-    # Same Toeplitz / adaptive-reuse setup as the scalar builder.
+    # Same Toeplitz / adaptive-reuse / Gauss-Jacobi setup as the scalar builder.
     toeplitz = _toeplitz_W_rows(widths, kernel_singularity)
     reuse_all = reuse_adaptive_blocks and toeplitz
     quad_opts = ({'limit': 200, 'epsabs': 1e-12, 'epsrel': 1e-12}
                  if reuse_all else {'limit': 100})
+    gj_enabled = singular_quadrature == 'auto'
 
     sample_u = float(widths[0]) * 0.5
     kernel_vec = _detect_kernel_vectorized(kernel, sample_u, is_vector=True, d=d)
@@ -714,12 +882,30 @@ def _build_W_with_basis_vector(kernel, mesh_breakpoints: np.ndarray,
         return integrand
 
     def classify_sing(sing, a_int, b_int):
-        """Split declared singular s-locations into interior points and an
-        endpoint flag for [a_int, b_int]; returns (interior, use_adaptive)."""
+        """Classify declared singular (s_loc, alpha) entries against the block
+        [a_int, b_int]; see the scalar builder's classify_sing for the
+        (touching, interior_pts) contract."""
         tol = 1e-12 * max(1.0, abs(b_int - a_int))
-        interior = [sp for sp in sing if a_int + tol < sp < b_int - tol]
-        endpoint = any(abs(sp - a_int) < tol or abs(sp - b_int) < tol for sp in sing)
-        return interior, (bool(interior) or endpoint)
+        touching = []
+        interior_pts = []
+        for loc, al in sing:
+            if a_int + tol < loc < b_int - tol:
+                touching.append(('interior', loc, al))
+                interior_pts.append(loc)
+            elif abs(loc - a_int) < tol:
+                touching.append(('left', loc, al))
+            elif abs(loc - b_int) < tol:
+                touching.append(('right', loc, al))
+        return touching, interior_pts
+
+    def gj_eligible(touching, a_int, b_int):
+        """Same eligibility rule as the scalar builder: every touching
+        singularity declares an exponent and no two singular points coincide."""
+        if not gj_enabled or any(al is None for _kind, _loc, al in touching):
+            return False
+        locs = sorted(loc for _kind, loc, _al in touching)
+        tol = 1e-12 * max(1.0, abs(b_int - a_int))
+        return all(l2 - l1 > 2.0 * tol for l1, l2 in zip(locs, locs[1:]))
 
     def adaptive_block(n, i, l, tau, t_l, h_l, a_int, b_int, interior_sing):
         """Singular block: per-basis adaptive quadrature."""
@@ -730,6 +916,55 @@ def _build_W_with_basis_vector(kernel, mesh_breakpoints: np.ndarray,
             val, _err = get_quad_vec()(make_integrand(tau, t_l, h_l, k),
                                        a_int, b_int, **kwargs)
             W[n, i, l, k, :, :] = val
+
+    def gj_block(n, i, l, tau, t_l, h_l, a_int, b_int, touching, interior_sing):
+        """Singular block with declared exponent(s): deterministic fixed-order
+        Gauss-Jacobi quadrature; vector analogue of the scalar builder's
+        gj_block (same piece splitting, folded weights, endpoint-anchored
+        kernel arguments, two-order check, and per-basis quad_vec fallback).
+        Returns True iff every basis function passed the check."""
+        al_left = 0.0
+        al_right = 0.0
+        interior = []
+        for kind, loc, al in touching:
+            if kind == 'left':
+                al_left = al
+            elif kind == 'right':
+                al_right = al
+            else:
+                interior.append((loc, al))
+        interior.sort()
+        bounds = [(a_int, al_left)] + interior + [(b_int, al_right)]
+        est = []
+        for o in orders:
+            acc = np.zeros((n_basis, d, d))
+            for (A, aA), (B, aB) in zip(bounds[:-1], bounds[1:]):
+                x, wf = _gauss_jacobi_nodes_weights(o, aB, aA)
+                half = 0.5 * (B - A)
+                s_q = 0.5 * (A + B) + half * x
+                u_q = (tau - B) + half * (1.0 - x)
+                if kernel_vec:
+                    kvals = np.asarray(kernel(u_q), dtype=np.float64)  # (o, d, d)
+                else:
+                    kvals = np.array([np.asarray(kernel(u), dtype=np.float64)
+                                      for u in u_q])  # (o, d, d)
+                xn = (s_q - t_l) / h_l
+                Bmat = np.array([npp.polyval(xn, basis[k]) for k in range(n_basis)])
+                acc = acc + half * np.einsum('kq,q,qde->kde', Bmat, wf, kvals)
+            est.append(acc)
+        v1, v2 = est
+        W[n, i, l, :, :, :] = v2
+        err = np.max(np.abs(v1 - v2), axis=(1, 2))  # (n_basis,)
+        ref = np.maximum(1.0, np.max(np.abs(v2), axis=(1, 2)))
+        ok = err <= smooth_check_tol * ref
+        for k in np.nonzero(~ok)[0]:
+            kwargs = dict(quad_opts)
+            if interior_sing:
+                kwargs['points'] = interior_sing
+            val, _err = get_quad_vec()(make_integrand(tau, t_l, h_l, int(k)),
+                                       a_int, b_int, **kwargs)
+            W[n, i, l, int(k), :, :] = val
+        return bool(ok.all())
 
     def store_smooth(n, i, l, tau, t_l, h_l, a_int, b_int, v1, v2):
         """Store the order-(ord+2) estimate v2 for every basis function, then
@@ -793,9 +1028,16 @@ def _build_W_with_basis_vector(kernel, mesh_breakpoints: np.ndarray,
             for i in range(p):
                 if skip_off is not None and skip_off[i, lag]:
                     continue
-                interior_sing, use_adaptive = classify_sing(sing_per_i[i], a_int, b_int)
-                if use_adaptive:
-                    adaptive_block(n, i, l, tau_n[i], t_l, h_l, a_int, b_int, interior_sing)
+                touching, interior_sing = classify_sing(sing_per_i[i], a_int, b_int)
+                if touching:
+                    if gj_eligible(touching, a_int, b_int):
+                        clean = gj_block(n, i, l, tau_n[i], t_l, h_l,
+                                         a_int, b_int, touching, interior_sing)
+                        if record:
+                            ok_off[i, lag] = clean
+                    else:
+                        adaptive_block(n, i, l, tau_n[i], t_l, h_l, a_int, b_int,
+                                       interior_sing)
                 else:
                     smooth_is.append(i)
 
@@ -820,9 +1062,15 @@ def _build_W_with_basis_vector(kernel, mesh_breakpoints: np.ndarray,
             b_int = tau
             if b_int <= a_int:
                 continue
-            interior_sing, use_adaptive = classify_sing(sing_per_i[i], a_int, b_int)
-            if use_adaptive:
-                adaptive_block(n, i, l, tau, t_l, h_l, a_int, b_int, interior_sing)
+            touching, interior_sing = classify_sing(sing_per_i[i], a_int, b_int)
+            if touching:
+                if gj_eligible(touching, a_int, b_int):
+                    clean = gj_block(n, i, l, tau, t_l, h_l, a_int, b_int,
+                                     touching, interior_sing)
+                    if record and clean:
+                        ok_diag[i] = True
+                else:
+                    adaptive_block(n, i, l, tau, t_l, h_l, a_int, b_int, interior_sing)
                 continue
             v1, v2 = smooth_diag_vals(a_int, b_int, tau, i)
             clean = store_smooth(n, i, l, tau, t_l, h_l, a_int, b_int, v1, v2)
@@ -857,13 +1105,15 @@ def _build_W_with_basis_vector(kernel, mesh_breakpoints: np.ndarray,
 
 def _build_W_vector(kernel, mesh_breakpoints, node_pos,
                     kernel_singularity, smooth_gl_order, d,
-                    smooth_check_tol=1e-9, reuse_adaptive_blocks=False):
+                    smooth_check_tol=1e-9, reuse_adaptive_blocks=False,
+                    singular_quadrature='auto'):
     """VIE-2 vector weight tensor: Lagrange basis, shape (M, p, M, p, d, d)."""
     basis = _lagrange_basis_coefs(node_pos)
     return _build_W_with_basis_vector(kernel, mesh_breakpoints, node_pos,
                                        kernel_singularity,
                                        smooth_gl_order, d, basis, smooth_check_tol,
-                                       reuse_adaptive_blocks)
+                                       reuse_adaptive_blocks,
+                                       singular_quadrature)
 
 
 # ---------------------------------------------------------------------------
@@ -1192,6 +1442,7 @@ def function_solve_VIE_2(*, kernel, g=None, mesh_breakpoints,
                           coll_divs: int = None, coll_choices: list[int] = None,
                           coll_nodes=None,
                           kernel_singularity=None,
+                          singular_quadrature: str = 'auto',
                           return_function: bool = False,
                           reuse_adaptive_blocks: bool = False,
                           show_warnings: bool = True,
@@ -1230,15 +1481,39 @@ def function_solve_VIE_2(*, kernel, g=None, mesh_breakpoints,
         ``lobatto_nodes``). Mutually exclusive with
         ``coll_divs``/``coll_choices``. Convergence of the chosen node set is
         the caller's responsibility.
-    kernel_singularity : None, float, list of float, or callable
+    kernel_singularity : None, float, dict, list, or callable
         Declare the singularity structure of the kernel.
 
         - ``None``: kernel is smooth everywhere.
         - ``float`` or list of float: convolution-style singularity locations
           (in $u = t - s$); e.g. ``0.0`` for $K(u) \sim u^{-\alpha}$.
+          Singular weight blocks use adaptive quadrature.
+        - dict ``{location: alpha}`` (or a list mixing bare locations and
+          ``(location, alpha)`` pairs): additionally declare the power-law
+          exponent, $K(u) \sim |u - u_0|^{-\alpha}$ with $0 < \alpha < 1$;
+          e.g. ``{0.0: 0.5}`` for an Abel kernel. Blocks whose declared
+          singularities all carry an exponent are evaluated by deterministic
+          fixed-order Gauss-Jacobi rules instead of adaptive quadrature (see
+          ``singular_quadrature``): the singular factor is built into the
+          quadrature weight exactly, which is typically more accurate than
+          the adaptive result, and -- being deterministic -- the blocks are
+          reused across rows on the uniform-mesh fast path, making singular-
+          kernel assembly as fast as smooth-kernel assembly with no
+          tolerance-level reuse (``reuse_adaptive_blocks`` becomes
+          unnecessary).
         - callable ``f(t) -> list[float]``: returns the singular $s$-locations
           for collocation point $t$. Forward-compatible with non-convolution
           $K(s, t)$.
+    singular_quadrature : {'auto', 'adaptive'}, optional
+        Quadrature policy for singular weight blocks. ``'auto'`` (default)
+        uses fixed-order Gauss-Jacobi rules on blocks whose declared
+        singularities carry exponents, guarded by the same two-order
+        acceptance check as the smooth Gauss-Legendre path (orders 6 and 8;
+        tolerance ~1e-9) with per-basis adaptive fallback on failure -- so a
+        mis-declared exponent degrades gracefully to the adaptive result.
+        ``'adaptive'`` forces adaptive quadrature for every singular block,
+        reproducing the bare-location behavior even when exponents are
+        declared.
     return_function : bool, optional
         If True, also return a callable solution wrapper.
     reuse_adaptive_blocks : bool, optional
@@ -1297,6 +1572,9 @@ def function_solve_VIE_2(*, kernel, g=None, mesh_breakpoints,
         raise TypeError("kernel must be callable")
     if g is not None and not callable(g):
         raise TypeError("g must be callable or None")
+    if singular_quadrature not in ('auto', 'adaptive'):
+        raise ValueError("singular_quadrature must be 'auto' or 'adaptive' "
+                         f"(got {singular_quadrature!r})")
 
     # Complex dispatch: block-decompose to a real problem of doubled dimension.
     if _samples_indicate_complex([kernel, g], mesh_breakpoints, None):
@@ -1308,6 +1586,7 @@ def function_solve_VIE_2(*, kernel, g=None, mesh_breakpoints,
             mesh_breakpoints=mesh_breakpoints,
             coll_nodes=node_pos,
             kernel_singularity=kernel_singularity,
+            singular_quadrature=singular_quadrature,
             return_function=return_function, show_warnings=show_warnings,
             reuse_adaptive_blocks=reuse_adaptive_blocks,
             _smooth_gl_order=_smooth_gl_order)
@@ -1338,7 +1617,8 @@ def function_solve_VIE_2(*, kernel, g=None, mesh_breakpoints,
     if not is_vector:
         W = _build_W_scalar(kernel, mesh_breakpoints, node_pos,
                             kernel_singularity, _smooth_gl_order,
-                            reuse_adaptive_blocks=reuse_adaptive_blocks)
+                            reuse_adaptive_blocks=reuse_adaptive_blocks,
+                            singular_quadrature=singular_quadrature)
         g_arr = np.zeros((M, p), dtype=np.float64)
         if g is not None:
             for n in range(M):
@@ -1365,7 +1645,8 @@ def function_solve_VIE_2(*, kernel, g=None, mesh_breakpoints,
     # shared across all right-hand sides in the matrix case.
     W = _build_W_vector(kernel, mesh_breakpoints, node_pos,
                         kernel_singularity, _smooth_gl_order, d,
-                        reuse_adaptive_blocks=reuse_adaptive_blocks)
+                        reuse_adaptive_blocks=reuse_adaptive_blocks,
+                        singular_quadrature=singular_quadrature)
 
     sample_t = float(mesh_breakpoints[0] + node_pos[0] * widths[0])
     m = _detect_g_matrix_cols(g, d, sample_t)
@@ -1435,6 +1716,7 @@ def function_solve_VIDE(*, kernel, a=None, g=None, soln_init_value,
                          coll_divs: int = None, coll_choices: list[int] = None,
                          coll_nodes=None,
                          kernel_singularity=None,
+                         singular_quadrature: str = 'auto',
                          return_function: bool = False,
                          reuse_adaptive_blocks: bool = False,
                          show_warnings: bool = True,
@@ -1471,8 +1753,13 @@ def function_solve_VIDE(*, kernel, a=None, g=None, soln_init_value,
         Collocation node positions given directly as floats in $[0, 1]$; see
         ``function_solve_VIE_2``. Mutually exclusive with
         ``coll_divs``/``coll_choices``.
-    kernel_singularity : None, float, list of float, or callable
-        Declare integrable singularities; see ``function_solve_VIE_2``.
+    kernel_singularity : None, float, dict, list, or callable
+        Declare integrable singularities; supports the same forms as
+        ``function_solve_VIE_2``, including ``{location: alpha}`` dicts that
+        enable the deterministic Gauss-Jacobi path for singular blocks.
+    singular_quadrature : {'auto', 'adaptive'}, optional
+        Quadrature policy for singular weight blocks; see
+        ``function_solve_VIE_2``.
     return_function : bool, optional
         If True, also return a callable solution wrapper.
     reuse_adaptive_blocks : bool, optional
@@ -1513,6 +1800,10 @@ def function_solve_VIDE(*, kernel, a=None, g=None, soln_init_value,
     if a is not None and not callable(a):
         raise TypeError("a must be callable or None")
 
+    if singular_quadrature not in ('auto', 'adaptive'):
+        raise ValueError("singular_quadrature must be 'auto' or 'adaptive' "
+                         f"(got {singular_quadrature!r})")
+
     # Complex dispatch.
     if _samples_indicate_complex([kernel, g, a], mesh_breakpoints, soln_init_value):
         sample_u = float(np.diff(mesh_breakpoints)[0]) * 0.5
@@ -1525,6 +1816,7 @@ def function_solve_VIDE(*, kernel, a=None, g=None, soln_init_value,
             mesh_breakpoints=mesh_breakpoints,
             coll_nodes=node_pos,
             kernel_singularity=kernel_singularity,
+            singular_quadrature=singular_quadrature,
             return_function=return_function, show_warnings=show_warnings,
             reuse_adaptive_blocks=reuse_adaptive_blocks,
             _smooth_gl_order=_smooth_gl_order)
@@ -1578,7 +1870,8 @@ def function_solve_VIDE(*, kernel, a=None, g=None, soln_init_value,
         W = _build_W_with_basis_scalar(
             kernel, mesh_breakpoints, node_pos,
             kernel_singularity, _smooth_gl_order, vide_basis,
-            reuse_adaptive_blocks=reuse_adaptive_blocks)
+            reuse_adaptive_blocks=reuse_adaptive_blocks,
+            singular_quadrature=singular_quadrature)
         g_arr = _sample_callable_scalar(g)
         a_arr = _sample_callable_scalar(a)
         y_prime, y_boundary = _dlang_module.function_solve_vide_d(
@@ -1609,7 +1902,8 @@ def function_solve_VIDE(*, kernel, a=None, g=None, soln_init_value,
     W = _build_W_with_basis_vector(
         kernel, mesh_breakpoints, node_pos,
         kernel_singularity, _smooth_gl_order, d, vide_basis,
-        reuse_adaptive_blocks=reuse_adaptive_blocks)
+        reuse_adaptive_blocks=reuse_adaptive_blocks,
+        singular_quadrature=singular_quadrature)
     a_arr = _sample_a_at_coll(a, mesh_breakpoints, node_pos, widths, M, p, d)
 
     # Matrix-valued problem is signalled by a 2-D (d, m) initial value.
@@ -2081,6 +2375,7 @@ def function_solve_VIE_1(*, kernel, g=None, soln_init_value=None,
                           coll_divs: int = None, coll_choices: list[int] = None,
                           coll_nodes=None,
                           kernel_singularity=None,
+                          singular_quadrature: str = 'auto',
                           return_function: bool = False,
                           force_continuous: bool = False,
                           reuse_adaptive_blocks: bool = False,
@@ -2127,7 +2422,7 @@ def function_solve_VIE_1(*, kernel, g=None, soln_init_value=None,
         endpoint, $c_m = 1$ (see Notes for the convergence condition). The
         default discontinuous method ($S_{m-1}^{(-1)}$) imposes no such
         restriction and is generally the better default.
-    kernel_singularity, return_function, reuse_adaptive_blocks, show_warnings :
+    kernel_singularity, singular_quadrature, return_function, reuse_adaptive_blocks, show_warnings :
         See ``function_solve_VIE_2``.
 
     Notes
@@ -2169,6 +2464,10 @@ def function_solve_VIE_1(*, kernel, g=None, soln_init_value=None,
         coll_nodes, coll_divs, coll_choices,
         default_divs=3, default_choices=[1, 2, 3],
         exclude_zero=True, fname="function_solve_VIE_1")
+
+    if singular_quadrature not in ('auto', 'adaptive'):
+        raise ValueError("singular_quadrature must be 'auto' or 'adaptive' "
+                         f"(got {singular_quadrature!r})")
 
     # Reject node sets for which the chosen VIE-1 method does not converge.
     # The criteria assume a smooth kernel (Brunner Thm 2.4.2(b): |K(t,t)|>=k0>0),
@@ -2226,6 +2525,7 @@ def function_solve_VIE_1(*, kernel, g=None, soln_init_value=None,
             mesh_breakpoints=mesh_breakpoints,
             coll_nodes=node_pos,
             kernel_singularity=kernel_singularity,
+            singular_quadrature=singular_quadrature,
             return_function=return_function,
             force_continuous=force_continuous,
             show_warnings=show_warnings,
@@ -2270,7 +2570,8 @@ def function_solve_VIE_1(*, kernel, g=None, soln_init_value=None,
             W = _build_W_with_basis_scalar(
                 kernel, mesh_breakpoints, node_pos,
                 kernel_singularity, _smooth_gl_order, cont_basis,
-                reuse_adaptive_blocks=reuse_adaptive_blocks)
+                reuse_adaptive_blocks=reuse_adaptive_blocks,
+                singular_quadrature=singular_quadrature)
             adv_U, adv_0 = _vie1_cont_advance(node_pos)
             y, boundary = _dlang_module.function_solve_vie1_cont_d(
                 W, g_arr, adv_U, adv_0, float(soln_init_value))
@@ -2282,7 +2583,8 @@ def function_solve_VIE_1(*, kernel, g=None, soln_init_value=None,
 
         W = _build_W_scalar(kernel, mesh_breakpoints, node_pos,
                             kernel_singularity, _smooth_gl_order,
-                            reuse_adaptive_blocks=reuse_adaptive_blocks)
+                            reuse_adaptive_blocks=reuse_adaptive_blocks,
+                            singular_quadrature=singular_quadrature)
         y = _dlang_module.function_solve_vie1_d(W, g_arr)
         if return_function:
             polys = _build_polynomials(y, mesh_breakpoints, node_pos)
@@ -2304,12 +2606,14 @@ def function_solve_VIE_1(*, kernel, g=None, soln_init_value=None,
         W = _build_W_with_basis_vector(kernel, mesh_breakpoints, node_pos,
                                        kernel_singularity, _smooth_gl_order, d,
                                        cont_basis,
-                                       reuse_adaptive_blocks=reuse_adaptive_blocks)
+                                       reuse_adaptive_blocks=reuse_adaptive_blocks,
+                                       singular_quadrature=singular_quadrature)
         adv_U, adv_0 = _vie1_cont_advance(node_pos)
     else:
         W = _build_W_vector(kernel, mesh_breakpoints, node_pos,
                             kernel_singularity, _smooth_gl_order, d,
-                            reuse_adaptive_blocks=reuse_adaptive_blocks)
+                            reuse_adaptive_blocks=reuse_adaptive_blocks,
+                            singular_quadrature=singular_quadrature)
 
     sample_t = float(mesh_breakpoints[0] + node_pos[0] * widths[0])
     m = _detect_g_matrix_cols(g, d, sample_t)
