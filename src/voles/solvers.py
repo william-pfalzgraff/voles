@@ -613,7 +613,7 @@ def _product_mesh_setup(kernel_values_, time_step, coll_divs, coll_choices, mesh
     return Q, p, N_orig, N, K, d, M, np.arange(M + 1) * (Q * time_step)
 
 
-def _stack_matrix_results(results, return_function, d, m_cols, M, breakpoints):
+def _stack_matrix_results(results, return_function, d, m_cols):
     """Combine per-column ``(values, solution)`` pairs from the ``_product``
     drivers into the matrix-valued result."""
     soln = np.stack([r[0] for r in results], axis=2)
@@ -651,7 +651,7 @@ def _solve_vie2_product_path(kernel_values_, g_values, time_step, coll_divs, col
                     setup=setup)
             with ThreadPoolExecutor(max_workers=_column_workers(m_cols)) as ex:
                 results = list(ex.map(_col, range(m_cols)))
-            return _stack_matrix_results(results, return_function, d, m_cols, M, breakpoints)
+            return _stack_matrix_results(results, return_function, d, m_cols)
         g = _check_series("g_values", g, N_orig, kernel_values_.shape,
                           (N_orig,) if d == 0 else (N_orig, d))[:N]
 
@@ -712,7 +712,7 @@ def _solve_vide_product_path(kernel_values_, a_values, g_values, soln_init_value
                 return_function, setup=setup)
         with ThreadPoolExecutor(max_workers=_column_workers(m_cols)) as ex:
             results = list(ex.map(_col, range(m_cols)))
-        return _stack_matrix_results(results, return_function, d, m_cols, M, breakpoints)
+        return _stack_matrix_results(results, return_function, d, m_cols)
 
     # ---------------------------------------------------------------- g, y0
     g = None if g_values is None else _check_series(
@@ -781,7 +781,7 @@ def _solve_vie1_product_path(kernel_values_, g_values, soln_init_value, time_ste
                     return_function, setup=setup)
             with ThreadPoolExecutor(max_workers=_column_workers(m_cols)) as ex:
                 results = list(ex.map(_col, range(m_cols)))
-            return _stack_matrix_results(results, return_function, d, m_cols, M, breakpoints)
+            return _stack_matrix_results(results, return_function, d, m_cols)
         g = _check_series("g_values", g, N_orig, kernel_values_.shape,
                           (N_orig,) if d == 0 else (N_orig, d))[:N]
 

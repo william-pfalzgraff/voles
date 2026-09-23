@@ -70,6 +70,8 @@ class _SolutionFunction(_SolutionListMixin):
     """Callable wrapping the per-interval Lagrange polynomials.
 
     `y(t)` evaluates the piecewise polynomial at scalar or array `t`.
+    Construct via `from_unit_coefs`; the `polynomials` list described below
+    is built lazily on first access.
 
     For scalar problems, `polynomials` is a list of `numpy.polynomial.Polynomial`
     objects, one per mesh interval. For vector problems with d components,
@@ -113,7 +115,7 @@ class _SolutionFunction(_SolutionListMixin):
         return self._polys
 
     def __len__(self):
-        return len(self._unit) if self._polys is None else len(self._polys)
+        return len(self._unit)
 
     def __call__(self, t):
         scalar_input = (np.isscalar(t) or np.ndim(t) == 0)
@@ -122,44 +124,19 @@ class _SolutionFunction(_SolutionListMixin):
         idx = np.searchsorted(bps, t_arr, side='right') - 1
         idx = np.clip(idx, 0, len(self) - 1)
 
-        if self._unit is not None:
-            # Horner in the local variable of each point's interval, all
-            # points at once. Evaluating in the local variable also avoids
-            # the cancellation of the absolute-time monomial form, whose
-            # coefficients grow like (t / h)^degree.
-            e = self._edges
-            x = (t_arr - e[idx]) / (e[idx + 1] - e[idx])
-            c = self._unit[idx]                  # (T, P, *comp)
-            x = x.reshape(x.shape + (1,) * (c.ndim - 2))
-            out = c[:, -1]
-            for k in range(c.shape[1] - 2, -1, -1):
-                out = out * x + c[:, k]
-            if self._d == 0:
-                return float(out[0]) if scalar_input else out
-            return out[0] if scalar_input else out
-
-        if self._m:
-            # Matrix case: each interval has a (d, m) array of polynomials.
-            out = np.empty((len(t_arr), self._d, self._m), dtype=float)
-            for j, (ti, ii) in enumerate(zip(t_arr, idx)):
-                polys_n = self.polynomials[int(ii)]
-                for r in range(self._d):
-                    for c in range(self._m):
-                        out[j, r, c] = polys_n[r, c](ti)
-            return out[0] if scalar_input else out
-
+        # Horner in the local variable of each point's interval, all points
+        # at once. Evaluating in the local variable also avoids the
+        # cancellation of the absolute-time monomial form, whose coefficients
+        # grow like (t / h)^degree.
+        e = self._edges
+        x = (t_arr - e[idx]) / (e[idx + 1] - e[idx])
+        c = self._unit[idx]                  # (T, P, *comp)
+        x = x.reshape(x.shape + (1,) * (c.ndim - 2))
+        out = c[:, -1]
+        for k in range(c.shape[1] - 2, -1, -1):
+            out = out * x + c[:, k]
         if self._d == 0:
-            out = np.empty(t_arr.shape, dtype=float)
-            for j, (ti, ii) in enumerate(zip(t_arr, idx)):
-                out[j] = self.polynomials[int(ii)](ti)
             return float(out[0]) if scalar_input else out
-
-        # Vector case: each interval has d component polynomials
-        out = np.empty((len(t_arr), self._d), dtype=float)
-        for j, (ti, ii) in enumerate(zip(t_arr, idx)):
-            polys_n = self.polynomials[int(ii)]
-            for r in range(self._d):
-                out[j, r] = polys_n[r](ti)
         return out[0] if scalar_input else out
 
 
